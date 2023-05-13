@@ -2,5 +2,7 @@
 src = "src"
 out = "out"
 libs = ["lib"]
-
-# See more config options https://github.com/foundry-rs/foundry/tree/master/config
+# TODO: Change to "shanghai" when Arbitrum supports EIP-3855
+evm_version = "paris"
+optimizer = true
+optimizer_runs = 19_066
