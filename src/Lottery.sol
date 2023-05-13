@@ -3,21 +3,46 @@ pragma solidity ^0.8.20;
 
 import {Ownable} from "openzeppelin-contracts/access/Ownable.sol";
 
-/// @notice Register a purchase for one or more tickets.
-struct Purchase {
+/// @notice Register a receipt for one or more tickets.
+struct Receipt {
+    /// @notice The owner address.
     address owner;
-    uint256 poolId;
-    uint256 ticketId;
-    uint256 count;
+    /// @notice The associated pool id.
+    /// @dev 2**64 - 1 = 18446744073709551616, which should not be reached.
+    uint64 poolId;
+    /// @notice The starting ticket id this receipt is for.
+    /// @dev 2**128 - 1 = 340282366920938463463374607431768211455, should be enough.
+    uint128 ticketId;
+    /// @notice The number of tickets bought in this receipt.
+    /// @dev 2**64 - 1 = 18446744073709551616, which should not be reached.
+    uint64 count;
 }
 
 /// @notice Register information relative to a lottery pool.
 struct Pool {
-    uint256 expiry;
-    uint256 ticketPrice;
-    uint256 depositedAmount;
-    uint256 winningTicketId;
-    uint256 feeBps;
+    /// @notice The pool expiry timestamp.
+    /// @dev 2**48-1 = 281474976710655, human race will have died when it's reached.
+    uint48 expiry;
+    /// @notice The pool ticket price in wei.
+    /// @dev 2**64 - 1 = 18446744073709551615 ~= 18.4 ETH.
+    uint64 ticketPrice;
+    /// @notice The pool starting jackpot in wei.
+    /// @dev 2**96 - 1 = 79228162514264337593543950335 ~= 79B ETH.
+    uint96 startingJackpot;
+    /// @notice The non-winner percent in 2 basis points (10000 = 100.00%, 100 = 1.00%, 1 = 0.01%).
+    /// @dev 2**16 - 1 = 65535 ~= 655%.
+    uint16 noWinnerPercent;
+    /// @notice The fee percent in 2 basis points (10000 = 100.00%, 100 = 1.00%, 1 = 0.01%).
+    /// @dev 2**16 - 1 = 65535 ~= 655%.
+    uint16 feePercent;
+    /// @notice The pool deposited amount in wei.
+    /// @dev 2**96 - 1 = 79228162514264337593543950335 ~= 79B ETH.
+    uint96 depositedAmount;
+    /// @notice The winning ticket id when the pool is settled.
+    /// @dev 2**128 - 1 = 340282366920938463463374607431768211455, should be enough.
+    uint128 winningTicketId;
+    /// @notice Wether or not the lottery pool has been settled.
+    bool settled;
 }
 
 contract Lottery is Ownable {
@@ -30,13 +55,16 @@ contract Lottery is Ownable {
     /// @notice The collection of lottery pools.
     mapping(uint256 poolId => Pool pool) public pools;
 
-    /// @notice The next available purchase id.
-    uint256 public nextPurchaseId;
-    /// @notice The collection of purchases.
-    mapping(uint256 purchaseId => Purchase purchase) public purchases;
+    /// @notice The next available receipt id.
+    uint256 public nextReceiptId;
+    /// @notice The collection of receipts.
+    mapping(uint256 receiptId => Receipt receipt) public receipts;
 
-    /// @notice The total fee reserve available.
-    uint256 public feeReserve;
+    /// @notice The available amount that can be reinvested in next lottery pools.
+    uint256 public availableAmount;
+
+    /// @notice The available fee reserve.
+    uint256 public availableFee;
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////
     //                                              EVENTS                                            //
@@ -46,34 +74,39 @@ contract Lottery is Ownable {
     /// @param poolId The pool id.
     /// @param expiry The pool expiry.
     /// @param ticketPrice The pool ticket price.
-    /// @param feeBps The pool fee basis points.
+    /// @param startingJackpot The starting amount from previous pools that settled without winners.
+    /// @param noWinnerPercent The pool no winner percent.
+    /// @param feePercent The pool fee percent.
     event PoolCreated(
         uint256 poolId,
         uint256 expiry,
         uint256 ticketPrice,
-        uint256 feeBps
+        uint256 startingJackpot,
+        uint256 noWinnerPercent,
+        uint256 feePercent
     );
 
     /// @notice Emitted when tickets are bought from a pool.
     /// @param poolId The pool id.
     /// @param count The amount of ticket bought.
     /// @param recipient The recipient address.
-    event TicketsPurchased(uint256 poolId, uint256 count, address recipient);
+    event TicketsReceiptd(uint256 poolId, uint256 count, address recipient);
 
     /// @notice Emitted when a pool is settled and a winning ticket is picked.
     /// @param poolId The pool id.
-    /// @param winningTicketId The winning ticket id.
-    event PoolSettled(uint256 poolId, uint256 winningTicketId);
+    /// @param winningTicketId The winning ticket id (only valid if hasWinner is true).
+    /// @param hasWinner Wether the settlement found a winner ticket or not.
+    event PoolSettled(uint256 poolId, uint256 winningTicketId, bool hasWinner);
 
     /// @notice Emitted when a winner is claiming its jackpot.
     /// @param poolId The pool id.
     /// @param winner The winner address.
-    /// @param purchaseId The winning purchase id.
+    /// @param receiptId The winning receipt id.
     /// @param jackpot The collected jackpot.
     event JackpotClaimed(
         uint256 poolId,
         address winner,
-        uint256 purchaseId,
+        uint256 receiptId,
         uint256 jackpot
     );
 
@@ -85,21 +118,59 @@ contract Lottery is Ownable {
     //                                              ERRORS                                            //
     ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-    error InvalidPrice(uint256 poolId, uint256 price, uint256 given);
+    /// @notice Reverted when creating a pool with an invalid ticket price.
+    /// @param price The ticket price.
+    error InvalidTicketPrice(uint256 price);
+
+    /// @notice Reverted when creating a pool with an invalid non-winner percent.
+    /// @param percent The non-winner percent.
+    error InvalidNoWinnerPercent(uint256 percent);
+
+    /// @notice Reverted when creating a pool with an invalid fee percent.
+    /// @param percent The fee percent.
+    error InvalidFeePercent(uint256 percent);
+
+    /// @notice Reverted when creating a pool with an invalid expiry.
+    /// @param expiry The expiry.
+    error InvalidExpiry(uint256 expiry);
+
+    /// @notice Reverted when trying to receipt tickets with an incorrect price.
+    /// @param poolId The pool id.
+    /// @param price The requested price.
+    /// @param given The given funds.
+    error IncorrectPrice(uint256 poolId, uint256 price, uint256 given);
+
+    /// @notice Reverted when trying to receipt tickets on a pool which reached the cutoff period.
+    /// @param poolId The pool id.
+    /// @param remainingTime The remaining time before settlement.
     error CutoffPeriodReached(uint256 poolId, uint256 remainingTime);
+
+    /// @notice Reverted when trying settle a pool that did not expired yet.
+    /// @param poolId The pool id.
+    /// @param expiry The pool expiry.
+    /// @param timestamp The current timestamp.
     error ExpiryNotReached(uint256 poolId, uint256 expiry, uint256 timestamp);
-    error AlreadySettled(uint256 poolId, uint256 winningTicketId);
+
+    /// @notice Reverted when trying settle a pool has already been settled.
+    /// @param poolId The pool id.
+    error AlreadySettled(uint256 poolId);
+
+    /// @notice Reverted when trying check if a receipt is a winner on a pool that did not settled.
+    /// @param poolId The pool id.
     error NotSettled(uint256 poolId);
-    error NotWinner(uint256 purchaseId);
+
+    /// @notice Reverted when trying claim the jackpot with a loosing receipt.
+    /// @param receiptId The receipt id.
+    error NotWinner(uint256 receiptId);
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////
     //                                         VIEW FUNCTIONS                                         //
     ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-    /// @notice Check if a given purchase id is a winner.
-    /// @param purchaseId The puirchase id to check.
-    function isWinner(uint256 purchaseId) external view returns (bool) {
-        return _isWinner(purchases[purchaseId]);
+    /// @notice Check if a given receipt id is a winner.
+    /// @param receiptId The puirchase id to check.
+    function isWinner(uint256 receiptId) external view returns (bool) {
+        return _isWinner(receipts[receiptId]);
     }
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -108,27 +179,59 @@ contract Lottery is Ownable {
 
     /// @notice Create a new lottery pool.
     /// @dev Only callable by the owner of the contract.
+    /// @dev Reverts if the non-winner or fee percent are invalid.
     /// @param expiry The pool expiry.
     /// @param ticketPrice The pool ticket price.
-    /// @param feeBps The pool fee basis points.
+    /// @param startingJackpot The starting amount from previous pools that settled without winners.
+    /// @param noWinnerPercent The no winner percent.
+    /// @param feePercent The pool fee percent.
     function createPool(
-        uint256 expiry,
-        uint256 ticketPrice,
-        uint256 feeBps
+        uint48 expiry,
+        uint64 ticketPrice,
+        uint96 startingJackpot,
+        uint16 noWinnerPercent,
+        uint16 feePercent
     ) external onlyOwner {
+        // Ensure the ticket price is at least 0.0001 ETH to avoid spaming.
+        if (ticketPrice < 1e14) {
+            revert InvalidTicketPrice(ticketPrice);
+        }
+
+        // Ensure the non-winner percent can't be equal or more than 100%.
+        if (noWinnerPercent >= 1e4) {
+            revert InvalidNoWinnerPercent(noWinnerPercent);
+        }
+
+        // Ensure the fee percent can't be equal or more than 100%.
+        if (feePercent >= 1e4) {
+            revert InvalidFeePercent(feePercent);
+        }
+
+        // Ensure the expiry is at least in 1 day.
+        if (expiry - block.timestamp < 1 days) {
+            revert InvalidExpiry(expiry);
+        }
+
         uint256 poolId = nextPoolId;
         nextPoolId += 1;
+
+        // Decrease the available amount by the amount that is reinvested.
+        availableAmount -= startingJackpot;
 
         Pool storage pool = pools[poolId];
         pool.expiry = expiry;
         pool.ticketPrice = ticketPrice;
-        pool.feeBps = feeBps;
+        pool.startingJackpot = startingJackpot;
+        pool.noWinnerPercent = noWinnerPercent;
+        pool.feePercent = feePercent;
 
         emit PoolCreated({
             poolId: poolId,
             expiry: expiry,
             ticketPrice: ticketPrice,
-            feeBps: feeBps
+            startingJackpot: startingJackpot,
+            noWinnerPercent: noWinnerPercent,
+            feePercent: feePercent
         });
     }
 
@@ -137,7 +240,7 @@ contract Lottery is Ownable {
     /// @param recipient The recipient address.
     function withdrawFee(uint256 amount, address recipient) external onlyOwner {
         // Update the remaioning fee reserve.
-        feeReserve -= amount;
+        availableFee -= amount;
 
         // Send the fee to the recipient.
         recipient.call{value: amount}("");
@@ -149,13 +252,13 @@ contract Lottery is Ownable {
     //                                        PUBLIC FUNCTIONS                                        //
     ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-    /// @notice Purchase `count` tickets on the given pool.
+    /// @notice Buy `count` tickets on the given pool.
     /// @dev Reverts if the given price is not correct to buy `count` tickets.
     /// @dev Reverts if the pool cutoff period has been reached.
     /// @param poolId The pool id.
-    /// @param count The number of ticket to buy.
+    /// @param count The number of tickets to buy.
     /// @param recipient The recipient address.
-    function purchaseTicketsForPool(
+    function buyTicketsForPool(
         uint256 poolId,
         uint256 count,
         address recipient
@@ -168,14 +271,14 @@ contract Lottery is Ownable {
         // Ensure the user is posting the correct price.
         uint256 price = count * ticketPrice;
         if (msg.value != price) {
-            revert InvalidPrice({
+            revert IncorrectPrice({
                 poolId: poolId,
                 price: price,
                 given: msg.value
             });
         }
 
-        // Ensure the pool is not in cut off period.
+        // Ensure the pool is not in cut off period (and the pool exists).
         uint256 remainingTime = pool.expiry - block.timestamp;
         if (remainingTime < 1 hours) {
             revert CutoffPeriodReached({
@@ -184,66 +287,64 @@ contract Lottery is Ownable {
             });
         }
 
-        // Avoid multiple SLOADs.
-        uint256 totalDepositedAmount = pool.depositedAmount + price;
+        // Create the receipt.
+        uint256 receiptId = nextReceiptId;
+        nextReceiptId += 1;
 
-        // Create the purchase.
-        uint256 purchaseId = nextPurchaseId;
-        nextPurchaseId += 1;
-
-        purchases[purchaseId] = Purchase({
+        receipts[receiptId] = Receipt({
             owner: recipient,
-            poolId: poolId,
+            // UNSAFE: Casting to uint64 is safe because pool ids are only incremented by one.
+            poolId: uint64(poolId),
             // NOTE: Compute the ticket id from the deposited amount and ticket price.
-            // NOTE: Starts at 1 to be able to use the 0 value as a non settled indicator.
-            ticketId: totalDepositedAmount / ticketPrice,
-            count: count
+            // UNSAFE: Casting to uint128 is safe because depositedAmount / ticketPrice should
+            // never be that large.
+            ticketId: uint128(pool.depositedAmount / ticketPrice),
+            // UNSAFE: Casting to uint64 is safe because ticket price would force the user
+            // to post an enormous amount of ETH to overflow.
+            count: uint64(count)
         });
 
         // Update the lottery pool.
-        pool.depositedAmount = totalDepositedAmount;
+        // UNSAFE: Casting to uint96 is safe because in order for it to overflow the user should have
+        // given more than 79B ETH as msg.value
+        pool.depositedAmount += uint96(price);
 
-        emit TicketsPurchased({
+        emit TicketsReceiptd({
             poolId: poolId,
             count: count,
             recipient: recipient
         });
     }
 
-    /// @notice Claim the jackpot of a winning purchase.
-    /// @dev Reverts if the pool has not been settled of if the purchase is not the winning one.
-    /// @param purchaseId The winning purchase id.
-    function claimProfit(uint256 purchaseId) external {
-        Purchase memory purchase = purchases[purchaseId];
+    /// @notice Claim the jackpot associated with a winning receipt.
+    /// @dev Reverts if the pool has not been settled of if the receipt is not the winning one.
+    /// @param receiptId The winning receipt id.
+    function claimProfit(uint256 receiptId) external {
+        Receipt memory receipt = receipts[receiptId];
 
         // Ensure it is a winner ticket.
-        if (_isWinner(purchase) == false) {
-            revert NotWinner({purchaseId: purchaseId});
+        if (_isWinner(receipt) == false) {
+            revert NotWinner({receiptId: receiptId});
         }
 
-        // Avoid multiple SLOADs.
-        uint256 depositedAmount = pools[purchase.poolId].depositedAmount;
+        Pool storage pool = pools[receipt.poolId];
 
-        // Compute the fee amount to collect.
-        uint256 fee = _feeAmount({
-            feeBps: pools[purchase.poolId].feeBps,
-            depositedAmount: depositedAmount
-        });
+        // Compute the jackpot to send to the winner.
+        uint256 jackpot = pool.startingJackpot + pool.depositedAmount;
+        jackpot -= _feeAmount({feePercent: pool.feePercent, jackpot: jackpot});
 
-        // Compute the jackpot to send to the winner (minus the fee).
-        uint256 jackpot = depositedAmount - fee;
+        // Delete the pool to prevent replays.
+        delete pools[receipt.poolId];
 
         // Send the jackpot to the user.
-        (bool _success, bytes memory _result) = purchase.owner.call{
+        (bool _success, bytes memory _result) = receipt.owner.call{
             value: jackpot
         }("");
 
-        // TODO: Do something to prevent replay.
-
         emit JackpotClaimed({
-            poolId: purchase.poolId,
-            winner: purchase.owner,
-            purchaseId: purchaseId,
+            poolId: receipt.poolId,
+            winner: receipt.owner,
+            receiptId: receiptId,
             jackpot: jackpot
         });
     }
@@ -270,59 +371,78 @@ contract Lottery is Ownable {
         }
 
         // Ensure the lottery pool has not already been settled.
-        if (pool.winningTicketId != 0) {
-            revert AlreadySettled({
-                poolId: poolId,
-                winningTicketId: pool.winningTicketId
-            });
+        if (pool.settled) {
+            revert AlreadySettled(poolId);
         }
 
         // Avoid multiple SLOADs.
         uint256 depositedAmount = pool.depositedAmount;
 
-        // Compute the winning ticket id from the given random value.
+        // Compute the number of tickets bought.
         uint256 ticketsCount = depositedAmount / pool.ticketPrice;
 
-        // NOTE: Shift the ID by 1.
-        uint256 winningTicketId = 1 + (random % ticketsCount);
+        // Inflate the total number of tickets to match with the non-winner percent of the pool.
+        uint256 inflatedTicketsCount = ticketsCount *
+            (1e4 / (1e4 - pool.noWinnerPercent));
 
-        // Update the lottery pool.
-        pool.winningTicketId = winningTicketId;
+        // Compute the winning ticket id.
+        uint256 winningTicketId = random % inflatedTicketsCount;
 
-        // Increase the fee reserve.
-        feeReserve += _feeAmount({
-            feeBps: pool.feeBps,
-            depositedAmount: depositedAmount
+        // Compute the fee and increase the available fee reserve.
+        uint256 fee = _feeAmount({
+            feePercent: pool.feePercent,
+            jackpot: pool.startingJackpot + depositedAmount
         });
+        availableFee += fee;
 
-        emit PoolSettled({poolId: poolId, winningTicketId: winningTicketId});
-    }
-
-    /// @notice Check is the given purchase is winner.
-    /// @dev Reverts if the pool has not been settled.
-    /// @param purchase The purchase struct.
-    function _isWinner(Purchase memory purchase) internal view returns (bool) {
-        uint256 winningTicketId = pools[purchase.poolId].winningTicketId;
-
-        // Ensure the pool has been settled.
-        if (winningTicketId != 0) {
-            revert NotSettled({poolId: purchase.poolId});
+        // If the winning ticket id exists, register it.
+        if (winningTicketId < ticketsCount) {
+            // UNSAFE: Casting is safe because there is no chance "inflatedTicketsCount" is above
+            // type(uint128).max.
+            pool.winningTicketId = uint128(winningTicketId);
+        }
+        // Else there is no winner so increase the available amount.
+        else {
+            availableAmount += depositedAmount - fee;
         }
 
-        uint256 firstTicketId = purchase.ticketId;
-        uint256 lastTicketId = firstTicketId + purchase.count;
+        pool.settled = true;
+
+        emit PoolSettled({
+            poolId: poolId,
+            winningTicketId: winningTicketId,
+            hasWinner: winningTicketId < ticketsCount
+        });
+    }
+
+    /// @notice Check if the given receipt is winner.
+    /// @dev Reverts if the pool has not been settled.
+    /// @param receipt The receipt struct.
+    function _isWinner(Receipt memory receipt) internal view returns (bool) {
+        Pool storage pool = pools[receipt.poolId];
+
+        // Ensure the pool has been settled.
+        if (pool.settled == false) {
+            revert NotSettled({poolId: receipt.poolId});
+        }
+
+        // Avoid multiple SLOADs.
+        uint256 winningTicketId = pool.winningTicketId;
+
+        uint256 firstTicketId = receipt.ticketId;
+        uint256 lastTicketId = firstTicketId + receipt.count;
 
         return
             winningTicketId >= firstTicketId && winningTicketId < lastTicketId;
     }
 
     /// @notice Compute the fee amount associated with a lottery pool.
-    /// @param feeBps The fee basis points (100 = 1%).
-    /// @param depositedAmount The deposited amount on the lottery pool.
+    /// @param feePercent The fee percent.
+    /// @param jackpot The pool jackpot.
     function _feeAmount(
-        uint256 feeBps,
-        uint256 depositedAmount
+        uint256 feePercent,
+        uint256 jackpot
     ) internal pure returns (uint256 feeAmount) {
-        feeAmount = (depositedAmount * feeBps) / 100;
+        feeAmount = (jackpot * feePercent) / 1e4;
     }
 }
