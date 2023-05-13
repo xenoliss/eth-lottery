@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.20;
 
+import {Ownable} from "openzeppelin-contracts/access/Ownable.sol";
+
 /// @notice Register a purchase for one or more tickets.
 struct Purchase {
-    /// @noticce The pucahse owner.
     address owner;
     uint256 poolId;
     uint256 ticketId;
@@ -19,7 +20,7 @@ struct Pool {
     uint256 feeBps;
 }
 
-contract Lottery {
+contract Lottery is Ownable {
     ////////////////////////////////////////////////////////////////////////////////////////////////////
     //                                             STORAGE                                            //
     ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -114,7 +115,7 @@ contract Lottery {
         uint256 expiry,
         uint256 ticketPrice,
         uint256 feeBps
-    ) external {
+    ) external onlyOwner {
         uint256 poolId = nextPoolId;
         nextPoolId += 1;
 
@@ -134,7 +135,7 @@ contract Lottery {
     /// @notice Withdraw fees and send them to the recipient.
     /// @param amount The fee amount to withdraw.
     /// @param recipient The recipient address.
-    function withdrawFee(uint256 amount, address recipient) external {
+    function withdrawFee(uint256 amount, address recipient) external onlyOwner {
         // Update the remaioning fee reserve.
         feeReserve -= amount;
 
