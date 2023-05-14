@@ -3,6 +3,8 @@ pragma solidity ^0.8.20;
 
 import {Ownable} from "openzeppelin-contracts/access/Ownable.sol";
 
+import {VRFV2WrapperConsumerBase, LinkTokenInterface} from "chainlink/v0.8/VRFV2WrapperConsumerBase.sol";
+
 /// @notice Register a receipt for one or more tickets.
 struct Receipt {
     /// @notice The owner address.
@@ -18,11 +20,18 @@ struct Receipt {
     uint64 count;
 }
 
+/// @notice The three possible settlement steps for a lottery pool.
+enum PoolSettlementStep {
+    Idle,
+    Initiated,
+    Settled
+}
+
 /// @notice Register information relative to a lottery pool.
 struct Pool {
     /// @notice The pool expiry timestamp.
-    /// @dev 2**48-1 = 281474976710655, human race will have died when it's reached.
-    uint48 expiry;
+    /// @dev 2**64 - 1 = 18446744073709551615, human race will have died when it's reached.
+    uint64 expiry;
     /// @notice The pool ticket price in wei.
     /// @dev 2**64 - 1 = 18446744073709551615 ~= 18.4 ETH.
     uint64 ticketPrice;
@@ -41,22 +50,24 @@ struct Pool {
     /// @notice The winning ticket id when the pool is settled.
     /// @dev 2**128 - 1 = 340282366920938463463374607431768211455, should be enough.
     uint128 winningTicketId;
-    /// @notice Wether or not the lottery pool has been settled.
-    bool settled;
+    /// @notice The pool settlement state.
+    PoolSettlementStep settlementStep;
 }
 
-contract Lottery is Ownable {
+contract Lottery is Ownable, VRFV2WrapperConsumerBase {
     ////////////////////////////////////////////////////////////////////////////////////////////////////
     //                                             STORAGE                                            //
     ////////////////////////////////////////////////////////////////////////////////////////////////////
 
     /// @notice The next available pool id.
     uint256 public nextPoolId;
+
     /// @notice The collection of lottery pools.
     mapping(uint256 poolId => Pool pool) public pools;
 
     /// @notice The next available receipt id.
     uint256 public nextReceiptId;
+
     /// @notice The collection of receipts.
     mapping(uint256 receiptId => Receipt receipt) public receipts;
 
@@ -66,9 +77,38 @@ contract Lottery is Ownable {
     /// @notice The available fee reserve.
     uint256 public availableFee;
 
+    /// @notice The gas limit for Chainlink VRFV2 callbacks.
+    uint256 public vrfCallbackGasLimit;
+
+    /// @notice The request confirmations used by Chainlink VRFV2.
+    uint256 public vrfRequestConfirmations;
+
+    /// @notice Link Chainlink VRFV2 request id to their associated lottery pool id.
+    mapping(uint256 vrfRequestId => uint256 poolId) public vrfRequestToPoolId;
+
+    constructor(
+        address link,
+        address vrfV2Wrapper,
+        uint32 _vrfCallbackGasLimit,
+        uint16 _vrfRequestConfirmations
+    ) VRFV2WrapperConsumerBase(link, vrfV2Wrapper) {
+        vrfCallbackGasLimit = _vrfCallbackGasLimit;
+        vrfRequestConfirmations = _vrfRequestConfirmations;
+        emit VrfCallbackGasLimitUpdated(_vrfCallbackGasLimit);
+        emit VrfRequestConfirmationsUpdated(_vrfRequestConfirmations);
+    }
+
     ////////////////////////////////////////////////////////////////////////////////////////////////////
     //                                              EVENTS                                            //
     ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    /// @notice Emitted when the callback gas limit for Chainlink VRF2 has been updated.
+    /// @param gasLimit The gas limit.
+    event VrfCallbackGasLimitUpdated(uint32 gasLimit);
+
+    /// @notice Emitted when the number of confirmation used by Chainlink VRF2 has been updated.
+    /// @param requestConfirmations The request confirmations.
+    event VrfRequestConfirmationsUpdated(uint16 requestConfirmations);
 
     /// @notice Emitted when a new pool is created.
     /// @param poolId The pool id.
@@ -110,9 +150,15 @@ contract Lottery is Ownable {
         uint256 jackpot
     );
 
-    /// @notice Emitted when the fees are withdrawn.
-    /// @param amount The collected fee amount.
-    event FeeWithdrawn(uint256 amount);
+    /// @notice Emitted when fees are withdrawn.
+    /// @param recipient The recipient address.
+    /// @param amount The withdrawn fee amount.
+    event FeeWithdrawn(address recipient, uint256 amount);
+
+    /// @notice Emitted when links are withdrawn.
+    /// @param recipient The recipient address.
+    /// @param amount The withdrawn link amount.
+    event LinkWithdrawn(address recipient, uint256 amount);
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////
     //                                              ERRORS                                            //
@@ -177,6 +223,24 @@ contract Lottery is Ownable {
     //                                         ADMIN FUNCTIONS                                        //
     ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+    /// @notice Set the Chainlink VRFV2 callback gas limit.
+    /// @dev Only callable by the owner of the contract.
+    /// @param gasLimit The gas limit to set.
+    function setVrfCallbackGasLimit(uint32 gasLimit) external onlyOwner {
+        vrfCallbackGasLimit = gasLimit;
+        emit VrfCallbackGasLimitUpdated(gasLimit);
+    }
+
+    /// @notice Set the Chainlink VRFV2 request confirmations.
+    /// @dev Only callable by the owner of the contract.
+    /// @param requestConfirmations The request confirmations to set.
+    function setVrfCallbackGasLimit(
+        uint16 requestConfirmations
+    ) external onlyOwner {
+        vrfRequestConfirmations = requestConfirmations;
+        emit VrfRequestConfirmationsUpdated(requestConfirmations);
+    }
+
     /// @notice Create a new lottery pool.
     /// @dev Only callable by the owner of the contract.
     /// @dev Reverts if the non-winner or fee percent are invalid.
@@ -186,7 +250,7 @@ contract Lottery is Ownable {
     /// @param noWinnerPercent The no winner percent.
     /// @param feePercent The pool fee percent.
     function createPool(
-        uint48 expiry,
+        uint64 expiry,
         uint64 ticketPrice,
         uint96 startingJackpot,
         uint16 noWinnerPercent,
@@ -236,16 +300,31 @@ contract Lottery is Ownable {
     }
 
     /// @notice Withdraw fees and send them to the recipient.
-    /// @param amount The fee amount to withdraw.
+    /// @dev Only callable by the owner of the contract.
     /// @param recipient The recipient address.
-    function withdrawFee(uint256 amount, address recipient) external onlyOwner {
+    /// @param amount The fee amount to withdraw.
+    function withdrawFee(address recipient, uint256 amount) external onlyOwner {
         // Update the remaioning fee reserve.
         availableFee -= amount;
 
         // Send the fee to the recipient.
         recipient.call{value: amount}("");
 
-        emit FeeWithdrawn(amount);
+        emit FeeWithdrawn(recipient, amount);
+    }
+
+    /// @notice Withdraw some amount of link tokens and send them to the recipient.
+    /// @dev Only callable by the owner of the contract.
+    /// @param recipient The recipient address.
+    /// @param amount The link amount to withdraw.
+    function withdrawLink(
+        address recipient,
+        uint256 amount
+    ) external onlyOwner {
+        LinkTokenInterface link = LinkTokenInterface(LINK);
+        link.transfer(recipient, amount);
+
+        emit LinkWithdrawn(recipient, amount);
     }
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -316,6 +395,33 @@ contract Lottery is Ownable {
         });
     }
 
+    /// @notice Initiate a pool settlement by querying a random number using Chainlink VRFV2.
+    /// @dev Reverts if the expiry has not been reached or if the pool has already been settled.
+    function intiatePoolSettlement(uint256 poolId) external {
+        Pool storage pool = pools[poolId];
+
+        // Ensure the expiry has been reached.
+        if (pool.expiry > block.timestamp) {
+            revert ExpiryNotReached({
+                poolId: poolId,
+                expiry: pool.expiry,
+                timestamp: block.timestamp
+            });
+        }
+
+        // Ensure the lottery pool has not already been settled.
+        if (pool.settlementStep != PoolSettlementStep.Idle) {
+            revert AlreadySettled(poolId);
+        }
+
+        // Trigger a Chainlink request to get a random number.
+        uint256 requestId = _requestRandomNumber();
+
+        // Link the request id with the pool id and update the pool settlement step.
+        vrfRequestToPoolId[requestId] = poolId;
+        pool.settlementStep = PoolSettlementStep.Initiated;
+    }
+
     /// @notice Claim the jackpot associated with a winning receipt.
     /// @dev Reverts if the pool has not been settled of if the receipt is not the winning one.
     /// @param receiptId The winning receipt id.
@@ -337,9 +443,7 @@ contract Lottery is Ownable {
         delete pools[receipt.poolId];
 
         // Send the jackpot to the user.
-        (bool _success, bytes memory _result) = receipt.owner.call{
-            value: jackpot
-        }("");
+        receipt.owner.call{value: jackpot}("");
 
         emit JackpotClaimed({
             poolId: receipt.poolId,
@@ -355,25 +459,11 @@ contract Lottery is Ownable {
 
     /// @notice Settle a given pool using a `random` value.
     /// @dev This registers the winning ticket id from the `random` value.
-    /// @dev Reverts if the expiry has not been reached or if the pool has already been settled.
+    /// @dev Only called by the Chainlink VRFV2 callback so the safety checks have already been done.
     /// @param poolId The pool id.
-    /// @param random The random value used to settle.
+    /// @param random The random value provided by chainlink VRFV2 used to settle.
     function _settlePool(uint256 poolId, uint256 random) internal {
         Pool storage pool = pools[poolId];
-
-        // Ensure the expiry has been reached.
-        if (pool.expiry > block.timestamp) {
-            revert ExpiryNotReached({
-                poolId: poolId,
-                expiry: pool.expiry,
-                timestamp: block.timestamp
-            });
-        }
-
-        // Ensure the lottery pool has not already been settled.
-        if (pool.settled) {
-            revert AlreadySettled(poolId);
-        }
 
         // Avoid multiple SLOADs.
         uint256 depositedAmount = pool.depositedAmount;
@@ -406,7 +496,7 @@ contract Lottery is Ownable {
             availableAmount += depositedAmount - fee;
         }
 
-        pool.settled = true;
+        pool.settlementStep = PoolSettlementStep.Settled;
 
         emit PoolSettled({
             poolId: poolId,
@@ -422,7 +512,7 @@ contract Lottery is Ownable {
         Pool storage pool = pools[receipt.poolId];
 
         // Ensure the pool has been settled.
-        if (pool.settled == false) {
+        if (pool.settlementStep != PoolSettlementStep.Settled) {
             revert NotSettled({poolId: receipt.poolId});
         }
 
@@ -444,5 +534,34 @@ contract Lottery is Ownable {
         uint256 jackpot
     ) internal pure returns (uint256 feeAmount) {
         feeAmount = (jackpot * feePercent) / 1e4;
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////
+    //                                         	 VRFV2 FUNCTIONS                                      //
+    ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    /// @notice Request a random number from Chainlink VRFV2.
+    /// @return requestId The request id.
+    function _requestRandomNumber() internal returns (uint256 requestId) {
+        requestId = requestRandomness({
+            // UNSAFE: Casting to uint32 is safe because it is never set to an higher value.
+            _callbackGasLimit: uint32(vrfCallbackGasLimit),
+            // UNSAFE: Casting to uint16 is safe because it is never set to an higher value.
+            _requestConfirmations: uint16(vrfRequestConfirmations),
+            _numWords: 1
+        });
+    }
+
+    /// @notice Chainlink VRFV2 callback.
+    /// @param requestId The request id.
+    /// @param randomWords The generated random numbers.
+    function fulfillRandomWords(
+        uint256 requestId,
+        uint256[] memory randomWords
+    ) internal override {
+        _settlePool({
+            poolId: vrfRequestToPoolId[requestId],
+            random: randomWords[0]
+        });
     }
 }
