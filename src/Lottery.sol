@@ -20,10 +20,11 @@ struct Receipt {
     uint64 count;
 }
 
-/// @notice The three possible settlement steps for a lottery pool.
-enum PoolSettlementStep {
+/// @notice The fours possible settlement states for a lottery pool.
+enum PoolSettlementState {
     Idle,
     Initiated,
+    RandomFecthed,
     Settled
 }
 
@@ -51,7 +52,7 @@ struct Pool {
     /// @dev 2**128 - 1 = 340282366920938463463374607431768211455, should be enough.
     uint128 winningTicketId;
     /// @notice The pool settlement state.
-    PoolSettlementStep settlementStep;
+    PoolSettlementState settlementState;
 }
 
 contract Lottery is Ownable, VRFV2WrapperConsumerBase {
@@ -180,13 +181,13 @@ contract Lottery is Ownable, VRFV2WrapperConsumerBase {
     /// @param expiry The expiry.
     error InvalidExpiry(uint256 expiry);
 
-    /// @notice Reverted when trying to receipt tickets with an incorrect price.
+    /// @notice Reverted when trying to purchase tickets with an incorrect price.
     /// @param poolId The pool id.
     /// @param price The requested price.
     /// @param given The given funds.
     error IncorrectPrice(uint256 poolId, uint256 price, uint256 given);
 
-    /// @notice Reverted when trying to receipt tickets on a pool which reached the cutoff period.
+    /// @notice Reverted when trying to purchase tickets on a pool which reached the cutoff period.
     /// @param poolId The pool id.
     /// @param remainingTime The remaining time before settlement.
     error CutoffPeriodReached(uint256 poolId, uint256 remainingTime);
@@ -197,13 +198,15 @@ contract Lottery is Ownable, VRFV2WrapperConsumerBase {
     /// @param timestamp The current timestamp.
     error ExpiryNotReached(uint256 poolId, uint256 expiry, uint256 timestamp);
 
-    /// @notice Reverted when trying settle a pool has already been settled.
+    ///  @notice Reverted when an expeted pool settlement state is not the current one.
     /// @param poolId The pool id.
-    error AlreadySettled(uint256 poolId);
-
-    /// @notice Reverted when trying check if a receipt is a winner on a pool that did not settled.
-    /// @param poolId The pool id.
-    error NotSettled(uint256 poolId);
+    /// @param expected The expected pool settlement state.
+    /// @param current The current pool settlement state.
+    error WrongPoolSettlementState(
+        uint256 poolId,
+        PoolSettlementState expected,
+        PoolSettlementState current
+    );
 
     /// @notice Reverted when trying claim the jackpot with a loosing receipt.
     /// @param receiptId The receipt id.
@@ -410,16 +413,75 @@ contract Lottery is Ownable, VRFV2WrapperConsumerBase {
         }
 
         // Ensure the lottery pool has not already been settled.
-        if (pool.settlementStep != PoolSettlementStep.Idle) {
-            revert AlreadySettled(poolId);
+        if (pool.settlementState != PoolSettlementState.Idle) {
+            revert WrongPoolSettlementState({
+                poolId: poolId,
+                expected: PoolSettlementState.Idle,
+                current: pool.settlementState
+            });
         }
 
         // Trigger a Chainlink request to get a random number.
         uint256 requestId = _requestRandomNumber();
 
-        // Link the request id with the pool id and update the pool settlement step.
+        // Link the request id with the pool id.
         vrfRequestToPoolId[requestId] = poolId;
-        pool.settlementStep = PoolSettlementStep.Initiated;
+
+        // Initiate the pool settlement.
+        pool.settlementState = PoolSettlementState.Initiated;
+    }
+
+    /// @notice Finalize a pool settlement after a random number from Chainlink VRFV2 has been fetched.
+    function finalizePoolSettlement(uint256 poolId) external {
+        Pool storage pool = pools[poolId];
+
+        // Ensure the random number has been fetched.
+        if (pool.settlementState == PoolSettlementState.RandomFecthed) {
+            revert WrongPoolSettlementState({
+                poolId: poolId,
+                expected: PoolSettlementState.RandomFecthed,
+                current: pool.settlementState
+            });
+        }
+
+        // Avoid multiple SLOADs.
+        uint256 depositedAmount = pool.depositedAmount;
+
+        // Compute the number of tickets bought.
+        uint256 ticketsCount = depositedAmount / pool.ticketPrice;
+
+        // Inflate the total number of tickets to match with the non-winner percent of the pool.
+        uint256 inflatedTicketsCount = ticketsCount *
+            (1e4 / (1e4 - pool.noWinnerPercent));
+
+        // Compute the winning ticket id.
+        // NOTE: The random number from Chainlink VRFV2 was temporarly stored in pool.winningTicketId.
+        uint256 winningTicketId = pool.winningTicketId % inflatedTicketsCount;
+
+        // UNSAFE: Casting is safe because there is no chance "inflatedTicketsCount" is above
+        // type(uint128).max.
+        pool.winningTicketId = uint128(winningTicketId);
+
+        // Compute the fee and increase the available fee reserve.
+        uint256 fee = _feeAmount({
+            feePercent: pool.feePercent,
+            jackpot: pool.startingJackpot + depositedAmount
+        });
+        availableFee += fee;
+
+        // If the winning ticket does not exist, increase the available amount for the next lotteries.
+        if (winningTicketId >= ticketsCount) {
+            availableAmount += depositedAmount - fee;
+        }
+
+        // Move to the next and final pool settlement state.
+        pool.settlementState = PoolSettlementState.Settled;
+
+        emit PoolSettled({
+            poolId: poolId,
+            winningTicketId: winningTicketId,
+            hasWinner: winningTicketId < ticketsCount
+        });
     }
 
     /// @notice Claim the jackpot associated with a winning receipt.
@@ -457,54 +519,6 @@ contract Lottery is Ownable, VRFV2WrapperConsumerBase {
     //                                        INTERNAL FUNCTIONS                                      //
     ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-    /// @notice Settle a given pool using a `random` value.
-    /// @dev This registers the winning ticket id from the `random` value.
-    /// @dev Only called by the Chainlink VRFV2 callback so the safety checks have already been done.
-    /// @param poolId The pool id.
-    /// @param random The random value provided by chainlink VRFV2 used to settle.
-    function _settlePool(uint256 poolId, uint256 random) internal {
-        Pool storage pool = pools[poolId];
-
-        // Avoid multiple SLOADs.
-        uint256 depositedAmount = pool.depositedAmount;
-
-        // Compute the number of tickets bought.
-        uint256 ticketsCount = depositedAmount / pool.ticketPrice;
-
-        // Inflate the total number of tickets to match with the non-winner percent of the pool.
-        uint256 inflatedTicketsCount = ticketsCount *
-            (1e4 / (1e4 - pool.noWinnerPercent));
-
-        // Compute the winning ticket id.
-        uint256 winningTicketId = random % inflatedTicketsCount;
-
-        // Compute the fee and increase the available fee reserve.
-        uint256 fee = _feeAmount({
-            feePercent: pool.feePercent,
-            jackpot: pool.startingJackpot + depositedAmount
-        });
-        availableFee += fee;
-
-        // If the winning ticket id exists, register it.
-        if (winningTicketId < ticketsCount) {
-            // UNSAFE: Casting is safe because there is no chance "inflatedTicketsCount" is above
-            // type(uint128).max.
-            pool.winningTicketId = uint128(winningTicketId);
-        }
-        // Else there is no winner so increase the available amount.
-        else {
-            availableAmount += depositedAmount - fee;
-        }
-
-        pool.settlementStep = PoolSettlementStep.Settled;
-
-        emit PoolSettled({
-            poolId: poolId,
-            winningTicketId: winningTicketId,
-            hasWinner: winningTicketId < ticketsCount
-        });
-    }
-
     /// @notice Check if the given receipt is winner.
     /// @dev Reverts if the pool has not been settled.
     /// @param receipt The receipt struct.
@@ -512,8 +526,12 @@ contract Lottery is Ownable, VRFV2WrapperConsumerBase {
         Pool storage pool = pools[receipt.poolId];
 
         // Ensure the pool has been settled.
-        if (pool.settlementStep != PoolSettlementStep.Settled) {
-            revert NotSettled({poolId: receipt.poolId});
+        if (pool.settlementState != PoolSettlementState.Settled) {
+            revert WrongPoolSettlementState({
+                poolId: receipt.poolId,
+                expected: PoolSettlementState.Settled,
+                current: pool.settlementState
+            });
         }
 
         // Avoid multiple SLOADs.
@@ -559,9 +577,12 @@ contract Lottery is Ownable, VRFV2WrapperConsumerBase {
         uint256 requestId,
         uint256[] memory randomWords
     ) internal override {
-        _settlePool({
-            poolId: vrfRequestToPoolId[requestId],
-            random: randomWords[0]
-        });
+        Pool storage pool = pools[vrfRequestToPoolId[requestId]];
+        // NOTE: Dirty hack, we're temporarly storing the random number in the winningTicketId field
+        // to save some gas.
+        pool.winningTicketId = uint128(randomWords[0]);
+
+        // Move to the next pool settlement state.
+        pool.settlementState = PoolSettlementState.RandomFecthed;
     }
 }
